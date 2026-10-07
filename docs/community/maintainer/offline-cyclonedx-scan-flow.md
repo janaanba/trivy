@@ -802,7 +802,180 @@ Relevant source locations:
 - [`pkg/dependency/parser/nuget/config/parse.go`](../../../pkg/dependency/parser/nuget/config/parse.go)
 - [`pkg/fanal/analyzer/language/dotnet/packagesprops/packagesprops.go`](../../../pkg/fanal/analyzer/language/dotnet/packagesprops/packagesprops.go)
 
-## 10.8 How an existing SBOM is analyzed
+## 10.8 How Gradle dependencies are analyzed
+
+Gradle dependency discovery is based primarily on Gradle dependency lockfiles. A project may declare dependencies in `build.gradle` or `build.gradle.kts`, but the resolved versions and configurations are recorded in files named `gradle.lockfile` when dependency locking is enabled.
+
+The flow is:
+
+```text
+build.gradle / build.gradle.kts
+  -> Gradle resolves requested versions
+gradle.lockfile
+  -> Trivy parses group, artifact, version, and configuration
+types.Application
+  -> CycloneDX components and dependency edges
+```
+
+The analyzer is registered in [`pkg/fanal/analyzer/language/java/gradle/lockfile.go`](../../../pkg/fanal/analyzer/language/java/gradle/lockfile.go):
+
+```go
+func init() {
+	analyzer.RegisterPostAnalyzer(analyzer.TypeGradleLock, newGradleLockAnalyzer)
+}
+```
+
+It selects files whose names end with `gradle.lockfile`, then calls the common language parser with `types.Gradle`. The parser is [`pkg/dependency/parser/gradle/lockfile/parse.go`](../../../pkg/dependency/parser/gradle/lockfile/parse.go).
+
+Each non-comment lockfile line normally has this shape:
+
+```text
+group:artifact:version=configurations
+```
+
+For example:
+
+```text
+org.springframework:spring-core:6.1.5=compileClasspath,runtimeClasspath
+junit:junit:4.13.2=testCompileClasspath
+```
+
+Trivy creates a package with an internal identity based on the Gradle coordinates:
+
+```text
+org.springframework:spring-core:6.1.5
+```
+
+The resulting package type is `gradle`, and the report converter normally represents the library with a Maven-style PURL such as:
+
+```text
+pkg:maven/org.springframework/spring-core@6.1.5
+```
+
+### Gradle development dependencies
+
+The parser marks a package as a development dependency when all of its classpaths are test classpaths. A package associated with `testCompileClasspath` or `testRuntimeClasspath` can therefore be excluded by the default scan policy.
+
+Include these packages explicitly when the SBOM should cover test and build tooling:
+
+```bash
+trivy fs \
+  --format cyclonedx \
+  --include-dev-deps \
+  /path/to/gradle-project
+```
+
+### Gradle cache enrichment
+
+After parsing the lockfile, the analyzer searches the Gradle cache, normally under `$HOME/.gradle/caches` or the directory selected by `GRADLE_USER_HOME`. Cached `.pom` files can provide additional license names and dependency declarations.
+
+The enrichment logic is in [`pkg/fanal/analyzer/language/java/gradle/pom.go`](../../../pkg/fanal/analyzer/language/java/gradle/pom.go). If the cache is unavailable, Trivy can still report packages parsed from `gradle.lockfile`, but license data and deeper dependency edges may be incomplete.
+
+POM dependency edges are added only when the referenced package also exists in the parsed lockfile package set. This prevents Trivy from emitting an edge to an unresolved component.
+
+### Gradle completeness and offline behavior
+
+An unresolved declaration in `build.gradle` is weaker evidence than a concrete lockfile entry. A lockfile is especially important for offline analysis because it records selected versions without requiring Trivy to resolve version ranges remotely.
+
+The Gradle flow therefore follows the same evidence rule demonstrated by the npm testing report: a dependency declaration or dependency map alone does not guarantee that Trivy can emit a resolved SBOM component. The concrete package record must be available to the analyzer.
+
+Useful source files:
+
+- [`pkg/fanal/analyzer/language/java/gradle/lockfile.go`](../../../pkg/fanal/analyzer/language/java/gradle/lockfile.go)
+- [`pkg/dependency/parser/gradle/lockfile/parse.go`](../../../pkg/dependency/parser/gradle/lockfile/parse.go)
+- [`pkg/fanal/analyzer/language/java/gradle/pom.go`](../../../pkg/fanal/analyzer/language/java/gradle/pom.go)
+
+## 10.9 How Maven dependencies are analyzed
+
+Maven projects declare dependencies in `pom.xml`. Unlike a lockfile-first ecosystem, Maven commonly resolves versions and transitive dependencies by reading the POM and consulting the local Maven repository or configured remote repositories.
+
+The built-in analyzer is [`pkg/fanal/analyzer/language/java/pom/pom.go`](../../../pkg/fanal/analyzer/language/java/pom/pom.go). It recognizes files named `pom.xml` and creates a parser with the scan's offline setting and Maven mirror configuration:
+
+```go
+p := pom.NewParser(filePath,
+	pom.WithOffline(input.Options.Offline),
+	pom.WithConfigFileMirrors(input.Options.MavenMirrors),
+)
+```
+
+The parser in [`pkg/dependency/parser/java/pom/parse.go`](../../../pkg/dependency/parser/java/pom/parse.go) reads Maven coordinates such as:
+
+```xml
+<dependency>
+  <groupId>org.springframework</groupId>
+  <artifactId>spring-core</artifactId>
+  <version>6.1.5</version>
+</dependency>
+```
+
+It resolves project properties, dependency-management values, profiles, repositories, and transitive metadata when the required POMs are available. The package identity is based on Maven coordinates and is represented in reports with a PURL such as:
+
+```text
+pkg:maven/org.springframework/spring-core@6.1.5
+```
+
+The local repository normally defaults to `$HOME/.m2/repository`. With `--offline-scan`, Trivy avoids remote dependency-identification requests and relies on local POM/repository data. A project can still produce useful direct package information offline, but missing cached metadata can reduce transitive dependency, license, or version completeness.
+
+Maven integration-test POMs under paths matching `**/[src|target]/it/*/pom.xml` are marked as development dependencies so they can be excluded by default.
+
+## 10.10 How Composer dependencies are analyzed
+
+Composer projects declare dependencies in `composer.json` and record resolved packages in `composer.lock`. The analyzer is [`pkg/fanal/analyzer/language/php/composer/composer.go`](../../../pkg/fanal/analyzer/language/php/composer/composer.go).
+
+It scans `composer.lock`, skips lockfiles inside `vendor`, and reads the neighboring `composer.json` to distinguish `require` and `require-dev` packages:
+
+```text
+composer.json  -> direct production and development declarations
+composer.lock  -> resolved packages, versions, licenses, and requires
+                 -> Trivy application and dependency graph
+```
+
+The lockfile parser in [`pkg/dependency/parser/php/composer/parse.go`](../../../pkg/dependency/parser/php/composer/parse.go) reads both `packages` and `packages-dev`. Production packages take precedence when the same package appears in both lists. Package requirements are converted into edges after their concrete versions are found in the lockfile.
+
+Composer's `php` requirement and `ext-*` platform requirements are not emitted as library dependencies. License strings and arrays are normalized into Trivy license values. If `composer.json` is missing, the analyzer cannot reliably distinguish direct from indirect packages and retains the lockfile packages with less precise relationship classification.
+
+Development packages are marked as development dependencies and may require:
+
+```bash
+trivy fs --format cyclonedx --include-dev-deps /path/to/composer-project
+```
+
+## 10.11 How Poetry dependencies are analyzed
+
+Poetry projects use `pyproject.toml` for declarations and `poetry.lock` for resolved packages. The analyzer is [`pkg/fanal/analyzer/language/python/poetry/poetry.go`](../../../pkg/fanal/analyzer/language/python/poetry/poetry.go).
+
+The flow is:
+
+```text
+pyproject.toml  -> direct dependencies, groups, and production roots
+poetry.lock     -> package versions, categories, groups, and constraints
+                  -> Trivy application and dependency graph
+```
+
+The parser in [`pkg/dependency/parser/python/poetry/parse.go`](../../../pkg/dependency/parser/python/poetry/parse.go) reads package records, marks `category = "dev"` and non-main groups as development dependencies, and resolves dependency version ranges against the versions present in the lockfile.
+
+Package names are normalized before matching. If a dependency range cannot match an installed lockfile version, the edge is omitted and a debug message is recorded. This is the same evidence boundary seen in the npm testing report: a dependency constraint alone is not enough to emit a resolved component or relationship when the corresponding lockfile package is unavailable.
+
+The analyzer also reads `pyproject.toml` to identify direct dependencies and production roots. Without that file, the lockfile still supplies packages, but direct/transitive classification is less precise.
+
+## 10.12 How Conan dependencies are analyzed
+
+Conan projects can produce a `conan.lock` file containing resolved C/C++ dependency graph information. The analyzer is [`pkg/fanal/analyzer/language/c/conan/conan.go`](../../../pkg/fanal/analyzer/language/c/conan/conan.go), and the parser is [`pkg/dependency/parser/c/conan/parse.go`](../../../pkg/dependency/parser/c/conan/parse.go).
+
+The analyzer recognizes the default filename `conan.lock`, parses it into a Trivy application, and enriches package licenses from cached `conanfile.py` files when available. It supports Conan cache locations associated with both Conan 1 and Conan 2, including:
+
+```text
+CONAN_HOME/p
+CONAN_USER_HOME/.conan/data
+$HOME/.conan2/p
+$HOME/.conan/data
+```
+
+The cache lookup is enrichment rather than the primary package source. If the cache is unavailable, Trivy can still parse packages from `conan.lock`, but license metadata may be absent.
+
+Conan lockfiles may use a project-specific filename, but the built-in analyzer's default discovery requires `conan.lock` unless an explicit file pattern causes the file to be included in analysis. As with other lockfile ecosystems, missing concrete graph nodes limit the dependency edges that Trivy can represent.
+
+## 10.13 How an existing SBOM is analyzed
 
 The `sbom` target is different from `fs`. It does not discover dependencies by walking project manifests. It opens an existing SBOM, detects its format, decodes its components, and reuses its declared relationships.
 

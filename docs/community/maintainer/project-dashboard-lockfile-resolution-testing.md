@@ -228,3 +228,17 @@ PY
 The tests confirm that Trivy requires a resolvable package record to emit an npm component in this offline CycloneDX flow. A dependency reference such as `@babel/helper-validator-identifier: ^7.28.5` is not enough to create an SBOM component when `packages["node_modules/@babel/helper-validator-identifier"]` is missing.
 
 The practical remediation is to restore or regenerate a valid `package-lock.json`, then rerun the scan. If the package is a development dependency, include it with `--include-dev-deps` when the SBOM is intended to cover development and build tooling.
+
+## Related ecosystem flows
+
+The same distinction between declared dependencies, resolved package records, and local metadata applies to other ecosystems. The repository-wide implementation guide documents these flows:
+
+- [Offline filesystem-to-CycloneDX flow](offline-cyclonedx-scan-flow.md)
+- [Go module analysis](offline-cyclonedx-scan-flow.md#105-how-go-modules-are-analyzed)
+- [Python dependency analysis](offline-cyclonedx-scan-flow.md#106-how-python-dependencies-are-analyzed)
+- [.NET and NuGet analysis](offline-cyclonedx-scan-flow.md#107-how-net-and-nuget-dependencies-are-analyzed)
+- [Gradle dependency analysis](offline-cyclonedx-scan-flow.md#108-how-gradle-dependencies-are-analyzed)
+- [Maven dependency analysis](offline-cyclonedx-scan-flow.md#109-how-maven-dependencies-are-analyzed)
+- [Composer dependency analysis](offline-cyclonedx-scan-flow.md#1010-how-composer-dependencies-are-analyzed)
+- [Poetry dependency analysis](offline-cyclonedx-scan-flow.md#1011-how-poetry-dependencies-are-analyzed)
+- [Conan dependency analysis](offline-cyclonedx-scan-flow.md#1012-how-conan-dependencies-are-analyzed)
